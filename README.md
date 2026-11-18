@@ -4,6 +4,14 @@
 
 **EN:** An LSPosed module for HyperOS that makes the Dynamic Island semi-transparent ("glass"). The collapsed capsule is no longer solid black.
 
+### До / Before
+
+<img src="https://github.com/user-attachments/assets/7a09a6b0-22b0-4077-829e-6b8eef3aec36" width="420">
+
+### После / After
+
+<img src="https://github.com/user-attachments/assets/3b286894-47c0-4b9d-bb90-5d7d60c6048b" width="420">
+
 ## ✅ Проверено / Tested
 - Redmi Note 14
 - HyperOS 3 (3.0.303.0WOGRUXM.C08)
@@ -23,7 +31,7 @@
 4. Перезагрузите телефон.
 
 ## Прозрачность / Opacity
-Значение задаётся в коде: `GLASS = 0x60000000`. Число `60` это плотность: `40` прозрачнее, `80`/`A0` плотнее. После изменения пересоберите проект (GitHub Actions → Run workflow).
+Значение задаётся в коде: `GLASS = 0x60000000`. Число `60` это плотность: `40` прозрачнее, `80` / `A0` плотнее. После изменения пересоберите проект (GitHub Actions → Run workflow).
 
 ## Как удалить / Uninstall
 Выключите модуль в LSPosed и перезагрузите телефон.
