@@ -112,6 +112,7 @@ jobs:
           import android.content.res.Resources;
           import android.graphics.drawable.Drawable;
           import android.graphics.drawable.GradientDrawable;
+          import android.util.TypedValue;
 
           import java.util.HashSet;
           import java.util.Set;
@@ -250,6 +251,28 @@ jobs:
                       XposedBridge.log(t);
                   }
 
+                  // Drawables set via XML layouts (android:background) go through ResourcesImpl.loadDrawable.
+                  try {
+                      Class<?> impl = XposedHelpers.findClass("android.content.res.ResourcesImpl", null);
+                      XposedHelpers.findAndHookMethod(impl, "loadDrawable",
+                              Resources.class, TypedValue.class, int.class, int.class, Resources.Theme.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      try {
+                                          Resources r = (Resources) p.args[0];
+                                          String n = nameOf(r, (Integer) p.args[2]);
+                                          log("xmlDrawable", n);
+                                          Object res = p.getResult();
+                                          if (res instanceof Drawable) p.setResult(tweak(n, (Drawable) res));
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
                   // Only logs which arrays the island reads (blend colors etc.).
                   try {
                       XposedHelpers.findAndHookMethod(Resources.class, "obtainTypedArray",
@@ -277,4 +300,3 @@ jobs:
         with:
           name: IslandGlass-apk
           path: proj/app/build/outputs/apk/debug/*.apk
-          
