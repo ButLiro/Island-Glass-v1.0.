@@ -85,10 +85,18 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <application android:label="Island Glass" android:hasCode="true">
+              <application android:label="Island Glass" android:hasCode="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".SettingsActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
                   <meta-data android:name="xposedmodule" android:value="true" />
                   <meta-data android:name="xposeddescription" android:value="Glass (semi-transparent) HyperOS dynamic island by ButLiro" />
                   <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedsharedprefs" android:value="true" />
                   <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
               </application>
           </manifest>
@@ -108,28 +116,85 @@ jobs:
           cat > app/src/main/java/com/butliro/islandglass/Hook.java <<'EOF'
           package com.butliro.islandglass;
 
+          import android.animation.Animator;
+          import android.animation.AnimatorListenerAdapter;
+          import android.animation.ValueAnimator;
           import android.content.res.ColorStateList;
           import android.content.res.Resources;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.ColorFilter;
+          import android.graphics.LinearGradient;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.graphics.RectF;
+          import android.graphics.Shader;
+          import android.graphics.drawable.BitmapDrawable;
+          import android.graphics.drawable.ColorDrawable;
           import android.graphics.drawable.Drawable;
           import android.graphics.drawable.GradientDrawable;
+          import android.os.SystemClock;
           import android.util.TypedValue;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.ViewParent;
+          import android.widget.ImageView;
 
+          import java.util.Collections;
           import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Random;
           import java.util.Set;
+          import java.util.WeakHashMap;
 
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XSharedPreferences;
           import de.robv.android.xposed.XposedBridge;
           import de.robv.android.xposed.XposedHelpers;
           import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
           public class Hook implements IXposedHookLoadPackage {
 
+              private static final String MODULE = "com.butliro.islandglass";
+
               // ARGB: 0x60 = about 38% opacity. Raise it (0x80, 0xA0) for a denser glass.
               private static final int GLASS = 0x60000000;
               private static final int GLASS_HOVER = 0x60474747;
 
               private static final Set<String> SEEN = new HashSet<>();
+              private static final Map<View, Boolean> ACTIVE =
+                      Collections.synchronizedMap(new WeakHashMap<View, Boolean>());
+              private static final Map<Bitmap, Bitmap> FIXED =
+                      Collections.synchronizedMap(new WeakHashMap<Bitmap, Bitmap>());
+              private static final Map<Bitmap, Boolean> NOT_BLACK =
+                      Collections.synchronizedMap(new WeakHashMap<Bitmap, Boolean>());
+
+              // ---------------------------------------------------------------- settings
+
+              private static XSharedPreferences prefs;
+              private static long lastReload;
+
+              private static synchronized boolean pref(String key) {
+                  try {
+                      if (prefs == null) {
+                          prefs = new XSharedPreferences(MODULE, "settings");
+                          prefs.makeWorldReadable();
+                      }
+                      long now = SystemClock.uptimeMillis();
+                      if (now - lastReload > 3000) {
+                          prefs.reload();
+                          lastReload = now;
+                      }
+                      return prefs.getBoolean(key, true);
+                  } catch (Throwable t) {
+                      return true;
+                  }
+              }
+
+              // ----------------------------------------------------------------- helpers
 
               private static String nameOf(Resources r, int id) {
                   try {
@@ -142,7 +207,10 @@ jobs:
 
               private static void log(String kind, String n) {
                   if (n == null) return;
-                  if (!(n.contains("island") || n.contains("blur"))) return;
+                  String l = n.toLowerCase();
+                  if (!(l.contains("island") || l.contains("blur") || l.contains("bluetooth")
+                          || l.contains("headset") || l.contains("earbud") || l.contains("pods")
+                          || l.contains("headphone"))) return;
                   synchronized (SEEN) {
                       if (!SEEN.add(kind + ":" + n)) return;
                   }
@@ -162,13 +230,16 @@ jobs:
                   }
               }
 
-              private static Drawable tweak(String n, Drawable d) {
+              private static Drawable tweak(Resources r, String n, Drawable d) {
                   if (n == null || !(d instanceof GradientDrawable)) return d;
                   try {
                       GradientDrawable g = (GradientDrawable) ((GradientDrawable) d).mutate();
                       switch (n) {
                           case "dynamic_island_background":
                           case "dynamic_island_liveupdate_background":
+                              if (pref("textures")) {
+                                  return new GlassDrawable(g, r.getDisplayMetrics().density);
+                              }
                               g.setColor(GLASS);
                               break;
                           case "dynamic_island_shade":
@@ -183,6 +254,269 @@ jobs:
                   }
               }
 
+              // ------------------------------------------- black square behind headphones
+
+              private static boolean isDark(int c) {
+                  return (c >>> 24) >= 250
+                          && ((c >> 16) & 255) <= 40
+                          && ((c >> 8) & 255) <= 40
+                          && (c & 255) <= 40;
+              }
+
+              /** Returns a copy of the bitmap with the black background turned transparent, or null. */
+              private static Bitmap unblack(Bitmap src) {
+                  if (src == null || src.isRecycled()) return null;
+                  int w = src.getWidth();
+                  int h = src.getHeight();
+                  if (w < 8 || h < 8 || w > 400 || h > 400) return null;
+                  if (NOT_BLACK.containsKey(src)) return null;
+                  Bitmap cached = FIXED.get(src);
+                  if (cached != null) return cached;
+                  try {
+                      Bitmap s = src.copy(Bitmap.Config.ARGB_8888, false);
+                      if (s == null) {
+                          NOT_BLACK.put(src, Boolean.TRUE);
+                          return null;
+                      }
+                      int[] px = new int[w * h];
+                      s.getPixels(px, 0, w, 0, 0, w, h);
+                      if (!isDark(px[0]) || !isDark(px[w - 1])
+                              || !isDark(px[(h - 1) * w]) || !isDark(px[w * h - 1])) {
+                          NOT_BLACK.put(src, Boolean.TRUE);
+                          return null;
+                      }
+                      int gray = 0;
+                      int bright = 0;
+                      for (int c : px) {
+                          int r = (c >> 16) & 255;
+                          int g = (c >> 8) & 255;
+                          int b = c & 255;
+                          if (Math.abs(r - g) < 24 && Math.abs(g - b) < 24) gray++;
+                          if (r > 170 && g > 170 && b > 170) bright++;
+                      }
+                      float n = px.length;
+                      if (gray / n < 0.97f || bright / n < 0.01f) {
+                          NOT_BLACK.put(src, Boolean.TRUE);
+                          return null;
+                      }
+                      for (int i = 0; i < px.length; i++) {
+                          int c = px[i];
+                          int lum = (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 151 + (c & 255) * 28) >> 8;
+                          int a = lum < 10 ? 0 : Math.min(255, (lum - 10) * 255 / 245);
+                          px[i] = (a << 24) | 0x00FFFFFF;
+                      }
+                      Bitmap out = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888);
+                      FIXED.put(src, out);
+                      XposedBridge.log("IslandGlass removed black square from bitmap " + w + "x" + h);
+                      return out;
+                  } catch (Throwable t) {
+                      NOT_BLACK.put(src, Boolean.TRUE);
+                      return null;
+                  }
+              }
+
+              private static Drawable unblackDrawable(Resources r, Drawable d) {
+                  if (!(d instanceof BitmapDrawable)) return d;
+                  Bitmap nb = unblack(((BitmapDrawable) d).getBitmap());
+                  if (nb == null) return d;
+                  return new BitmapDrawable(r, nb);
+              }
+
+              // ------------------------------------------------------ jelly appear anim
+
+              private static boolean isIsland(View v) {
+                  if (!(v instanceof ViewGroup)) return false;
+                  String cn = v.getClass().getName().toLowerCase();
+                  String id = null;
+                  try {
+                      if (v.getId() != View.NO_ID) id = v.getResources().getResourceEntryName(v.getId());
+                  } catch (Throwable ignored) {
+                  }
+                  boolean hit = cn.contains("island") || (id != null && id.toLowerCase().contains("island"));
+                  if (hit) log("view", cn + "#" + id);
+                  return hit;
+              }
+
+              private static void jelly(final View v) {
+                  for (ViewParent pr = v.getParent(); pr != null; pr = pr.getParent()) {
+                      if (pr instanceof View && ACTIVE.containsKey(pr)) return;
+                  }
+                  if (ACTIVE.containsKey(v)) return;
+                  ACTIVE.put(v, Boolean.TRUE);
+                  ValueAnimator a = ValueAnimator.ofFloat(0f, 1f);
+                  a.setDuration(560);
+                  a.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                      @Override
+                      public void onAnimationUpdate(ValueAnimator an) {
+                          float t = (Float) an.getAnimatedValue();
+                          float fx = 1f - (float) (Math.exp(-6.5 * t) * Math.cos(2 * Math.PI * 1.7 * t));
+                          float fy = 1f - (float) (Math.exp(-6.0 * t) * Math.cos(2 * Math.PI * 2.1 * t + 0.6));
+                          v.setPivotX(v.getWidth() / 2f);
+                          v.setPivotY(0f);
+                          v.setScaleX(0.55f + 0.45f * fx);
+                          v.setScaleY(0.55f + 0.45f * fy);
+                      }
+                  });
+                  a.addListener(new AnimatorListenerAdapter() {
+                      private void done() {
+                          v.setScaleX(1f);
+                          v.setScaleY(1f);
+                          ACTIVE.remove(v);
+                      }
+
+                      @Override
+                      public void onAnimationEnd(Animator animation) {
+                          done();
+                      }
+
+                      @Override
+                      public void onAnimationCancel(Animator animation) {
+                          done();
+                      }
+                  });
+                  a.start();
+              }
+
+              // ------------------------------------------------------------ glass drawable
+
+              /** Glass capsule: translucent fill, glowing rim and slow rising bubbles. */
+              static final class GlassDrawable extends Drawable implements Runnable {
+                  private static final int N = 7;
+                  private final float[] radii;
+                  private final float radius;
+                  private final float density;
+                  private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint sheen = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint rim = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint bub = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint bubRing = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Path path = new Path();
+                  private final RectF rect = new RectF();
+                  private final float[] bx = new float[N];
+                  private final float[] bp = new float[N];
+                  private final float[] bs = new float[N];
+                  private final float[] br = new float[N];
+                  private final long t0 = SystemClock.uptimeMillis();
+                  private int alpha = 255;
+
+                  GlassDrawable(GradientDrawable src, float density) {
+                      this.density = density;
+                      float[] rr = null;
+                      float rad = 0f;
+                      try {
+                          rr = src.getCornerRadii();
+                      } catch (Throwable ignored) {
+                      }
+                      try {
+                          rad = src.getCornerRadius();
+                      } catch (Throwable ignored) {
+                      }
+                      radii = rr;
+                      radius = rad;
+
+                      fill.setStyle(Paint.Style.FILL);
+                      fill.setColor(GLASS);
+                      sheen.setStyle(Paint.Style.FILL);
+                      glow.setStyle(Paint.Style.STROKE);
+                      glow.setStrokeWidth(3f * density);
+                      glow.setColor(0x1CFFFFFF);
+                      rim.setStyle(Paint.Style.STROKE);
+                      rim.setStrokeWidth(1.3f * density);
+                      bub.setStyle(Paint.Style.FILL);
+                      bubRing.setStyle(Paint.Style.STROKE);
+                      bubRing.setStrokeWidth(0.8f * density);
+
+                      Random rnd = new Random(7);
+                      for (int i = 0; i < N; i++) {
+                          bx[i] = rnd.nextFloat();
+                          bp[i] = rnd.nextFloat();
+                          bs[i] = 0.12f + rnd.nextFloat() * 0.18f;
+                          br[i] = 1.5f + rnd.nextFloat() * 2.5f;
+                      }
+                  }
+
+                  @Override
+                  protected void onBoundsChange(Rect b) {
+                      float in = rim.getStrokeWidth() / 2f;
+                      rect.set(b.left + in, b.top + in, b.right - in, b.bottom - in);
+                      path.reset();
+                      float max = Math.min(rect.width(), rect.height()) / 2f;
+                      if (radii != null && radii.length >= 8) {
+                          float[] rr = radii.clone();
+                          for (int i = 0; i < rr.length; i++) rr[i] = Math.min(rr[i], max);
+                          path.addRoundRect(rect, rr, Path.Direction.CW);
+                      } else {
+                          float rad = Math.min(radius, max);
+                          path.addRoundRect(rect, rad, rad, Path.Direction.CW);
+                      }
+                      sheen.setShader(new LinearGradient(0, rect.top, 0, rect.bottom,
+                              0x38FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP));
+                      rim.setShader(new LinearGradient(rect.left, rect.top, rect.right, rect.bottom,
+                              new int[]{0xB0FFFFFF, 0x24FFFFFF, 0x24FFFFFF, 0xB0FFFFFF},
+                              new float[]{0f, 0.35f, 0.65f, 1f}, Shader.TileMode.CLAMP));
+                  }
+
+                  @Override
+                  public void draw(Canvas canvas) {
+                      if (rect.isEmpty()) return;
+                      int sc = -1;
+                      if (alpha < 255) {
+                          sc = canvas.saveLayerAlpha(rect.left, rect.top, rect.right, rect.bottom, alpha);
+                      }
+                      canvas.drawPath(path, fill);
+                      canvas.drawPath(path, sheen);
+
+                      canvas.save();
+                      canvas.clipPath(path);
+                      float w = rect.width();
+                      float h = rect.height();
+                      float t = (SystemClock.uptimeMillis() - t0) / 1000f;
+                      for (int i = 0; i < N; i++) {
+                          float rad = br[i] * density;
+                          float ph = (t * bs[i] + bp[i]) % 1f;
+                          float y = rect.bottom + rad - ph * (h + 2f * rad);
+                          float x = rect.left + bx[i] * w + (float) Math.sin(t * 0.9f + i * 1.7f) * 2.5f * density;
+                          float a = (float) Math.sin(Math.PI * ph);
+                          bub.setColor(((int) (0x30 * a) << 24) | 0xFFFFFF);
+                          bubRing.setColor(((int) (0x60 * a) << 24) | 0xFFFFFF);
+                          canvas.drawCircle(x, y, rad, bub);
+                          canvas.drawCircle(x, y, rad, bubRing);
+                      }
+                      canvas.restore();
+
+                      canvas.drawPath(path, glow);
+                      canvas.drawPath(path, rim);
+                      if (sc != -1) canvas.restoreToCount(sc);
+
+                      if (getCallback() != null) {
+                          scheduleSelf(this, SystemClock.uptimeMillis() + 40);
+                      }
+                  }
+
+                  @Override
+                  public void run() {
+                      invalidateSelf();
+                  }
+
+                  @Override
+                  public void setAlpha(int a) {
+                      alpha = a;
+                      invalidateSelf();
+                  }
+
+                  @Override
+                  public void setColorFilter(ColorFilter cf) {
+                  }
+
+                  @Override
+                  public int getOpacity() {
+                      return PixelFormat.TRANSLUCENT;
+                  }
+              }
+
+              // ---------------------------------------------------------------- the hook
+
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
                   if (!"com.android.systemui".equals(lpparam.packageName)) return;
@@ -196,7 +530,9 @@ jobs:
                               String n = nameOf(r, (Integer) p.args[0]);
                               log("drawable", n);
                               Object res = p.getResult();
-                              if (res instanceof Drawable) p.setResult(tweak(n, (Drawable) res));
+                              if (res instanceof Drawable) {
+                                  p.setResult(unblackDrawable(r, tweak(r, n, (Drawable) res)));
+                              }
                           } catch (Throwable ignored) {
                           }
                       }
@@ -264,7 +600,65 @@ jobs:
                                           String n = nameOf(r, (Integer) p.args[2]);
                                           log("xmlDrawable", n);
                                           Object res = p.getResult();
-                                          if (res instanceof Drawable) p.setResult(tweak(n, (Drawable) res));
+                                          if (res instanceof Drawable) {
+                                              p.setResult(unblackDrawable(r, tweak(r, n, (Drawable) res)));
+                                          }
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
+                  // Bitmaps that arrive at runtime (for example the headphones picture from Bluetooth)
+                  // never go through resources, so they are cleaned up right when an ImageView gets them.
+                  try {
+                      XposedHelpers.findAndHookMethod(ImageView.class, "setImageDrawable",
+                              Drawable.class, new XC_MethodHook() {
+                                  @Override
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      try {
+                                          Object o = p.args[0];
+                                          if (!(o instanceof BitmapDrawable)) return;
+                                          Bitmap nb = unblack(((BitmapDrawable) o).getBitmap());
+                                          if (nb == null) return;
+                                          ImageView iv = (ImageView) p.thisObject;
+                                          p.args[0] = new BitmapDrawable(iv.getResources(), nb);
+                                          Drawable bg = iv.getBackground();
+                                          if (bg instanceof ColorDrawable
+                                                  && ((ColorDrawable) bg).getColor() == 0xFF000000) {
+                                              iv.setBackground(null);
+                                          }
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
+                  // Jelly "pop" when the island becomes visible.
+                  try {
+                      XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      try {
+                                          p.setObjectExtra("old", ((View) p.thisObject).getVisibility());
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      try {
+                                          Object old = p.getObjectExtra("old");
+                                          if (old == null) return;
+                                          int now = (Integer) p.args[0];
+                                          if (now != View.VISIBLE || (Integer) old == View.VISIBLE) return;
+                                          View v = (View) p.thisObject;
+                                          if (isIsland(v) && pref("island")) jelly(v);
                                       } catch (Throwable ignored) {
                                       }
                                   }
@@ -292,6 +686,129 @@ jobs:
           }
           EOF
 
+          cat > app/src/main/java/com/butliro/islandglass/SettingsActivity.java <<'EOF'
+          package com.butliro.islandglass;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.CompoundButton;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Switch;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.File;
+
+          public class SettingsActivity extends Activity {
+
+              private static final String PREFS = "settings";
+              private SharedPreferences sp;
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+
+              @SuppressLint("WorldReadableFiles")
+              @SuppressWarnings("deprecation")
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  try {
+                      sp = getSharedPreferences(PREFS, Context.MODE_WORLD_READABLE);
+                  } catch (Throwable t) {
+                      sp = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                  }
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(20), dp(48), dp(20), dp(24));
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Island Glass");
+                  title.setTextSize(28);
+                  title.setPadding(0, 0, 0, dp(20));
+                  root.addView(title);
+
+                  addSwitch(root, "Улучшенные текстуры",
+                          "Стеклянный остров: подсвеченные края и медленные пузырьки внутри.",
+                          "textures");
+                  addSwitch(root, "Улучшенный Dynamic Island",
+                          "Желейное появление: остров быстро выскакивает и пружинит.",
+                          "island");
+
+                  TextView hint = new TextView(this);
+                  hint.setText("Изменения применяются после перезапуска SystemUI.");
+                  hint.setPadding(0, dp(8), 0, dp(12));
+                  root.addView(hint);
+
+                  Button restart = new Button(this);
+                  restart.setText("Перезапустить SystemUI (нужен root)");
+                  restart.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          try {
+                              Runtime.getRuntime().exec(new String[]{"su", "-c", "killall com.android.systemui"});
+                          } catch (Throwable t) {
+                              Toast.makeText(SettingsActivity.this,
+                                      "Не удалось получить root. Перезагрузите телефон.",
+                                      Toast.LENGTH_LONG).show();
+                          }
+                      }
+                  });
+                  root.addView(restart);
+
+                  setContentView(scroll);
+              }
+
+              private void addSwitch(LinearLayout root, String title, String desc, final String key) {
+                  Switch s = new Switch(this);
+                  s.setText(title);
+                  s.setTextSize(18);
+                  s.setChecked(sp.getBoolean(key, true));
+                  s.setPadding(0, dp(8), 0, dp(2));
+                  s.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                      @Override
+                      public void onCheckedChanged(CompoundButton v, boolean checked) {
+                          sp.edit().putBoolean(key, checked).commit();
+                          fixPerms();
+                      }
+                  });
+                  root.addView(s);
+
+                  TextView d = new TextView(this);
+                  d.setText(desc);
+                  d.setPadding(0, 0, 0, dp(16));
+                  root.addView(d);
+              }
+
+              private void fixPerms() {
+                  try {
+                      File dir = new File(getApplicationInfo().dataDir);
+                      dir.setExecutable(true, false);
+                      File shared = new File(dir, "shared_prefs");
+                      shared.setExecutable(true, false);
+                      shared.setReadable(true, false);
+                      new File(shared, PREFS + ".xml").setReadable(true, false);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  fixPerms();
+              }
+          }
+          EOF
+
       - name: Build
         working-directory: proj
         run: gradle assembleDebug --no-daemon
@@ -300,3 +817,4 @@ jobs:
         with:
           name: IslandGlass-apk
           path: proj/app/build/outputs/apk/debug/*.apk
+          
