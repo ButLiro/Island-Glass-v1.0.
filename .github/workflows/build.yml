@@ -1,0 +1,280 @@
+name: Build IslandGlass
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Create project files
+        run: |
+          mkdir -p proj/app/src/main/java/com/butliro/islandglass
+          mkdir -p proj/app/src/main/assets
+          mkdir -p proj/app/src/main/res/values
+          cd proj
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven {
+                      url 'https://api.xposed.info/'
+                      content { includeGroup 'de.robv.android.xposed' }
+                  }
+              }
+          }
+          rootProject.name = 'IslandGlass'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.butliro.islandglass'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.butliro.islandglass'
+                  minSdk 28
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="Island Glass" android:hasCode="true">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Glass (semi-transparent) HyperOS dynamic island by ButLiro" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.android.systemui</item>
+              </string-array>
+          </resources>
+          EOF
+
+          echo "com.butliro.islandglass.Hook" > app/src/main/assets/xposed_init
+
+          cat > app/src/main/java/com/butliro/islandglass/Hook.java <<'EOF'
+          package com.butliro.islandglass;
+
+          import android.content.res.ColorStateList;
+          import android.content.res.Resources;
+          import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.GradientDrawable;
+
+          import java.util.HashSet;
+          import java.util.Set;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public class Hook implements IXposedHookLoadPackage {
+
+              // ARGB: 0x60 = about 38% opacity. Raise it (0x80, 0xA0) for a denser glass.
+              private static final int GLASS = 0x60000000;
+              private static final int GLASS_HOVER = 0x60474747;
+
+              private static final Set<String> SEEN = new HashSet<>();
+
+              private static String nameOf(Resources r, int id) {
+                  try {
+                      if ((id >>> 24) != 0x7f) return null;
+                      return r.getResourceEntryName(id);
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              private static void log(String kind, String n) {
+                  if (n == null) return;
+                  if (!(n.contains("island") || n.contains("blur"))) return;
+                  synchronized (SEEN) {
+                      if (!SEEN.add(kind + ":" + n)) return;
+                  }
+                  XposedBridge.log("IslandGlass " + kind + " " + n);
+              }
+
+              private static Integer colorFor(String n) {
+                  if (n == null) return null;
+                  switch (n) {
+                      case "big_island_background_color":
+                      case "expended_island_background_color":
+                          return GLASS;
+                      case "big_island_background_color_hover":
+                          return GLASS_HOVER;
+                      default:
+                          return null;
+                  }
+              }
+
+              private static Drawable tweak(String n, Drawable d) {
+                  if (n == null || !(d instanceof GradientDrawable)) return d;
+                  try {
+                      GradientDrawable g = (GradientDrawable) ((GradientDrawable) d).mutate();
+                      switch (n) {
+                          case "dynamic_island_background":
+                          case "dynamic_island_liveupdate_background":
+                              g.setColor(GLASS);
+                              break;
+                          case "dynamic_island_shade":
+                              g.setColors(new int[]{0x00000000, GLASS});
+                              break;
+                          default:
+                              break;
+                      }
+                      return g;
+                  } catch (Throwable t) {
+                      return d;
+                  }
+              }
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  if (!"com.android.systemui".equals(lpparam.packageName)) return;
+                  XposedBridge.log("IslandGlass loaded in systemui");
+
+                  XC_MethodHook drawableHook = new XC_MethodHook() {
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) {
+                          try {
+                              Resources r = (Resources) p.thisObject;
+                              String n = nameOf(r, (Integer) p.args[0]);
+                              log("drawable", n);
+                              Object res = p.getResult();
+                              if (res instanceof Drawable) p.setResult(tweak(n, (Drawable) res));
+                          } catch (Throwable ignored) {
+                          }
+                      }
+                  };
+
+                  try {
+                      XposedHelpers.findAndHookMethod(Resources.class, "getDrawable",
+                              int.class, Resources.Theme.class, drawableHook);
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+                  try {
+                      XposedHelpers.findAndHookMethod(Resources.class, "getDrawableForDensity",
+                              int.class, int.class, Resources.Theme.class, drawableHook);
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
+                  try {
+                      XposedHelpers.findAndHookMethod(Resources.class, "getColor",
+                              int.class, Resources.Theme.class, new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      try {
+                                          String n = nameOf((Resources) p.thisObject, (Integer) p.args[0]);
+                                          log("color", n);
+                                          Integer c = colorFor(n);
+                                          if (c != null) p.setResult(c);
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
+                  try {
+                      XposedHelpers.findAndHookMethod(Resources.class, "getColorStateList",
+                              int.class, Resources.Theme.class, new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      try {
+                                          String n = nameOf((Resources) p.thisObject, (Integer) p.args[0]);
+                                          log("csl", n);
+                                          Integer c = colorFor(n);
+                                          if (c != null) p.setResult(ColorStateList.valueOf(c));
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
+                  // Only logs which arrays the island reads (blend colors etc.).
+                  try {
+                      XposedHelpers.findAndHookMethod(Resources.class, "obtainTypedArray",
+                              int.class, new XC_MethodHook() {
+                                  @Override
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      try {
+                                          log("array", nameOf((Resources) p.thisObject, (Integer) p.args[0]));
+                                      } catch (Throwable ignored) {
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IslandGlass-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
+          
